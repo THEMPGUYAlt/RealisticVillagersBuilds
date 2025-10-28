@@ -23,11 +23,52 @@ jobs:
           java-version: '21'
           distribution: 'temurin'
 
-      - name: ⚙️ Make Gradle executable
-        run: chmod +x ./gradlew
+      - name: 🔍 Detect build system
+        id: detect
+        run: |
+          if [ -f "gradlew" ]; then
+            echo "build_tool=gradle" >> "$GITHUB_OUTPUT"
+            chmod +x ./gradlew
+          elif [ -f "build.gradle" ] || [ -f "build.gradle.kts" ]; then
+            echo "build_tool=gradle" >> "$GITHUB_OUTPUT"
+          elif [ -f "pom.xml" ]; then
+            echo "build_tool=maven" >> "$GITHUB_OUTPUT"
+          else
+            echo "No recognized build tool found (Gradle/Maven)." >&2
+            exit 1
+          fi
 
-      - name: 🏗️ Build with Gradle
-        run: ./gradlew clean build
+      - name: 🏗️ Build project
+        run: |
+          if [ "${{ steps.detect.outputs.build_tool }}" = "gradle" ]; then
+            ./gradlew clean build || gradle clean build
+          elif [ "${{ steps.detect.outputs.build_tool }}" = "maven" ]; then
+            mvn -B clean package
+          fi
+
+      - name: 🏷️ Detect project version
+        id: version
+        run: |
+          VERSION="unknown"
+
+          if [ -f "pom.xml" ]; then
+            VERSION=$(xmllint --xpath "/*[local-name()='project']/*[local-name()='version']/text()" pom.xml 2>/dev/null || echo "unknown")
+          elif [ -f "build.gradle" ]; then
+            VERSION=$(grep -E "version\s*=\s*['\"]" build.gradle | head -n1 | sed -E "s/.*version\s*=\s*['\"]([^'\"]+)['\"].*/\1/")
+          elif [ -f "build.gradle.kts" ]; then
+            VERSION=$(grep -E "version\s*=\s*\"[^\"]+\"" build.gradle.kts | head -n1 | sed -E "s/.*version\s*=\s*\"([^\"]+)\".*/\1/")
+          fi
+
+          # Fallback: extract version from JAR manifest if needed
+          if [ "$VERSION" = "unknown" ]; then
+            JAR_FILE=$(find . -type f -name "*.jar" | head -n 1)
+            if [ -n "$JAR_FILE" ]; then
+              VERSION=$(unzip -p "$JAR_FILE" META-INF/MANIFEST.MF 2>/dev/null | grep "Implementation-Version:" | head -n1 | awk '{print $2}' | tr -d '\r')
+            fi
+          fi
+
+          echo "Detected version: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: 🏷️ Auto-generate tag (if manual dispatch)
         if: github.event_name == 'workflow_dispatch'
@@ -41,7 +82,7 @@ jobs:
             PATCH="${BASH_REMATCH[3]}"
             NEXT_TAG="v${MAJOR}.${MINOR}.$((PATCH + 1))"
           else
-            NEXT_TAG="v1.0.0"
+            NEXT_TAG="v${{ steps.version.outputs.version }}"
           fi
           echo "Creating new tag: $NEXT_TAG"
           git config user.name "github-actions"
@@ -49,18 +90,25 @@ jobs:
           git tag "$NEXT_TAG"
           git push origin "$NEXT_TAG"
           echo "tag_name=$NEXT_TAG" >> "$GITHUB_OUTPUT"
-      - name: 📤 Upload all files in target/ to GitHub Actions
+
+      - name: 📦 Collect build artifacts
+        run: |
+          mkdir -p artifacts
+          find . -type f \( -path "*/target/*.jar" -o -path "*/build/libs/*.jar" \) -exec cp {} artifacts/ \;
+        continue-on-error: true
+
+      - name: 📤 Upload all JARs
         uses: actions/upload-artifact@v4
         with:
           name: build-output
-          path: target/**
+          path: artifacts/**
 
-      - name: 🚀 Publish Release (from tag or release event)
+      - name: 🚀 Publish Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ github.event.release.tag_name || steps.tag.outputs.tag_name }}
           name: ${{ github.event.release.name || steps.tag.outputs.tag_name }}
-          body: ${{ github.event.release.body || 'Automated release via workflow_dispatch' }}
-          files: target/**
+          body: ${{ github.event.release.body || 'Automated Minecraft plugin release' }}
+          files: artifacts/**
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
